@@ -47,4 +47,15 @@ Contiene los scripts de entrenamiento de modelos usando selección génica basad
 > Cada uno de los scripts de esta sección (3 a 6) guarda:
 > - Modelos en formato `.rds`.  
 > - Matrices de resultados con C-Index y AUC (a 1 y 2 años), para los conjuntos de entrenamiento y validación.
+
+---
+
+## 4. Resultados
+
+- **7.Resultados.R**  
+  - Analiza los resultados obtenidos de todos los experimentos.  
+  - Carga las matrices generadas previamente y produce:  
+    - Tablas y gráficos (ver Anexo II y Capítulo 4 del documento).  
+    - Contrastes de hipótesis para evaluar el cumplimiento de los objetivos planteados.
+
 ---

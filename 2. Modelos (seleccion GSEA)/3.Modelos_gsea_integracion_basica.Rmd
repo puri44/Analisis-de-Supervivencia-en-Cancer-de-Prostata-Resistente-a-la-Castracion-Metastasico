@@ -1,0 +1,2332 @@
+---
+title: "Modelos con selección basada en GSEA e integración en dos etapas"
+author: "Purificación Hernández López"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Configuración inicial
+
+```{r}
+# Lista de paquetes necesarios: 
+list.of.packages <- c(
+  "mlr3", 
+  "mlr3proba", 
+  "mlr3misc", 
+  "mlr3learners", 
+  "mlr3tuning", 
+  "mlr3pipelines", 
+  "mlr3extralearners", 
+  "mlr3filters", 
+  "mlr3measures", 
+  "paradox",
+  "dplyr",
+  "purrr",
+  "survival",
+  "survAUC",
+  "survcomp",
+  "timeROC",
+  "survivalsvm",
+  "CoxBoost",
+  "reticulate"
+)
+
+# Función para instalar y cargar paquetes: 
+ipak <- function(pkg){
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) {
+    install.packages(new.pkg, dependencies = TRUE)
+  }
+  invisible(sapply(pkg, require, character.only = TRUE))
+}
+
+ipak(list.of.packages)
+
+# Configurar entorno virtual de Python (esto no es necesario una vez se han entrenado los modelos): 
+reticulate::use_virtualenv("deeplearn", require = TRUE)
+
+rm(list.of.packages, ipak)
+
+# Fijamos la semilla para reproducibilidad: 
+set.seed(2608)
+```
+
+Cargamos los datos de los 5 escenarios, incluyendo solo aquellos con las variables seleccionadas utilizando GSEA. 
+
+```{r}
+# ESCENARIO 1: Clinical before treatment
+training_clinical_bt <- readRDS("training_clinical_bt_prev.rds")
+test_clinical_bt <- readRDS("test_clinical_bt_prev.rds")
+
+# ESCENARIO 2: Expresión
+training_expresion <- readRDS("training_expresion_gsea_prev.rds")
+test_expresion <- readRDS("test_expresion_gsea_prev.rds")
+
+# ESCENARIO 3: Both before treatment
+training_both_bt <- readRDS("training_both_bt_gsea_prev.rds")
+test_both_bt <- readRDS("test_both_bt_gsea_prev.rds")
+
+# ESCENARIO 4: Clinical after treatment
+training_clinical_at <- readRDS("training_clinical_at_prev.rds")
+test_clinical_at <- readRDS("test_clinical_at_prev.rds")
+  
+# ESCENARIO 5: Both after treatment
+training_both_at <- readRDS("training_both_at_gsea_prev.rds")
+test_both_at <- readRDS("test_both_at_gsea_prev.rds")
+```
+
+```{r}
+# Codificamos Death como integer (daba problemas como factor): 
+training_clinical_bt$Death <- as.integer(as.character(training_clinical_bt$Death))
+test_clinical_bt$Death <- as.integer(as.character(test_clinical_bt$Death))
+
+training_clinical_at$Death <- as.integer(as.character(training_clinical_at$Death))
+test_clinical_at$Death <- as.integer(as.character(test_clinical_at$Death))
+```
+
+## Función para realizar resampling estratificado (no incorporado en mlr3)
+
+```{r}
+# Función para realizar resampling estratificado dada la tarea (no incorporado en mlr3): 
+stratified_surv_cv <- function(task_surv, folds = 5) {
+  
+  data <- task_surv$data()
+  data$Death <- as.factor(data$Death)
+  
+  set.seed(2608)
+  
+  # Separamos los índices por clase (evento o censura): 
+  idx_event <- which(data$Death == 1)
+  idx_censor <- which(data$Death == 0)
+  
+  # Asignamos un fold a cada grupo por separado (estratificación manual): 
+  folds_event <- sample(rep(1:folds, length.out = length(idx_event)))
+  folds_censor <- sample(rep(1:folds, length.out = length(idx_censor)))
+  
+  # Combinamos los folds:
+  test_sets <- lapply(1:folds, function(i) {
+    c(idx_event[folds_event == i], idx_censor[folds_censor == i])
+  })
+  train_sets <- lapply(1:folds, function(i) {
+    setdiff(seq_len(nrow(data)), test_sets[[i]])
+  })
+  
+  # Instanciamos el resampling personalizado: 
+  resampling <- rsmp("custom")
+  resampling$instantiate(task_surv, train_sets = train_sets, test_sets = test_sets)
+  
+  return(resampling)
+}
+```
+
+## Función para calcular las métricas de discriminación
+
+```{r}
+# Métrica a utilizar sobre el conjunto de training para el entrenamiento (C-Index de Uno, definido por weight_meth = "G2"): 
+measure <- msr("surv.cindex",weight_meth = "G2", id = "surv.cindex.uno")
+
+# Algoritmo de búsqueda de hiperparámetros a utilizar durante el entrenamiento (búsqueda exhaustiva): 
+tuner <- mlr3tuning::tnr("grid_search", resolution = 5)
+```
+
+```{r}
+# Función para calcular las métricas de discriminación dado el modelo entrenado: 
+score_survival_metrics <- function(learner, train_data, test_data, time_col, event_col, plot_roc = FALSE) {
+  
+  # Creamos tareas diferentes para entrenamiento y validación: 
+  task_train <- TaskSurv$new(id = "train", backend = train_data, time = time_col, event = event_col)
+  task_test  <- TaskSurv$new(id = "test",  backend = test_data,  time = time_col, event = event_col)
+
+  # Predicción sobre cada tarea: 
+  pred_train <- learner$predict(task_train)
+  pred_test  <- learner$predict(task_test)
+
+  # Calculamos las métricas (entrenamiento): 
+  cindex_train <- pred_train$score(msr("surv.cindex"))
+  
+  auc_train_1yr <- AUC.uno(
+    Surv(train_data[[time_col]], train_data[[event_col]]),
+    Surv(train_data[[time_col]], train_data[[event_col]]),
+    pred_train$crank,
+    times = 365
+  )$auc
+
+  auc_train_2yr <- AUC.uno(
+    Surv(train_data[[time_col]], train_data[[event_col]]),
+    Surv(train_data[[time_col]], train_data[[event_col]]),
+    pred_train$crank,
+    times = 730
+  )$auc
+
+  # Calculamos las métricas (validación): 
+  cindex_test <- pred_test$score(msr("surv.cindex"))
+
+  auc_test_1yr <- AUC.uno(
+    Surv(train_data[[time_col]], train_data[[event_col]]),
+    Surv(test_data[[time_col]], test_data[[event_col]]),
+    pred_test$crank,
+    times = 365
+  )$auc
+
+  auc_test_2yr <- AUC.uno(
+    Surv(train_data[[time_col]], train_data[[event_col]]),
+    Surv(test_data[[time_col]], test_data[[event_col]]),
+    pred_test$crank,
+    times = 730
+  )$auc
+
+  # Curvas ROC: 
+  if (plot_roc) {
+    roc <- timeROC(
+      T = test_data[[time_col]],
+      delta = test_data[[event_col]],
+      marker = pred_test$crank,
+      cause = 1,
+      weighting = "marginal",
+      times = c(365, 730),
+      iid = TRUE
+    )
+
+    plot(roc, time = 365, col = "#1B9E77", title = FALSE)
+    plot(roc, time = 730, add = TRUE, col = "#4A1486")
+    abline(0, 1, lty = 2, col = "gray")
+    legend("bottomright", legend = c("1 año", "2 años"), col = c("#1B9E77", "#4A1486"), lwd = 2)
+    title("Curvas ROC dependientes del tiempo")
+  }
+
+  # Resultados en forma de lista: 
+  list(
+    cindex   = list(train = cindex_train, test = cindex_test),
+    auc_1yr  = list(train = auc_train_1yr, test = auc_test_1yr),
+    auc_2yr  = list(train = auc_train_2yr, test = auc_test_2yr)
+  )
+}
+```
+
+# Random Survival Forest
+
+Entrenamiento de los modelos RSF con validación cruzada y AutoTuning. 
+
+## Escenario 1
+
+```{r, eval=FALSE}
+# Creamos la tarea de supervivencia: 
+task <- TaskSurv$new(
+  id = "rsf",
+  backend = training_clinical_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+# Generamos una validación cruzada estratificada en 5 pliegues:  
+resampling <- stratified_surv_cv(task, folds = 5)
+
+# Definimos un modelo Random Survival Forest (RSF), con cálculo de la importancia basada en la impureza: 
+learner <- lrn("surv.ranger", importance = "impurity")
+
+# Definimos el espacio de búsqueda de hiperparámetros para el ajuste: 
+search_space <- ps(
+  mtry = p_int(lower = 2, upper = 4),
+  min.node.size = p_int(lower = 3, upper = 10),
+  num.trees = p_int(lower = 100, upper = 500)
+)
+
+# Configuramos el AutoTuner con el modelo , la métrica, la validación cruzada y el espacio de búsqueda: 
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+# Entrenamos el modelo, ajustando automáticamente los hiperparámetros: 
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el mejor modelo, su configuración y sus parámetros en un archivo rds:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "rsf_escenario1.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado y extraemos sus componentes: 
+model_data <- readRDS("rsf_escenario1.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+# Evaluamos el modelo usando la función score_survival_metrics: 
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_bt,
+  test_data   = test_clinical_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+# Data.frame para almacenar los resultados: 
+result_row <- data.frame(
+  escenario     = "rsf_escenario1",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mtry          = best_params$mtry,
+  min_node      = best_params$min.node.size,
+  num_trees     = best_params$num.trees
+)
+
+# Mostramos y guardamos los resultados: 
+print(result_row)
+results_matrix <- result_row
+```
+
+# Escenario 2
+
+```{r, eval=FALSE}
+task <- TaskSurv$new(
+  id = "rsf",
+  backend = training_expresion,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.ranger", importance = "impurity")
+
+search_space <- ps(
+  mtry     = p_int(lower = 4, upper = 11),
+  min.node.size = p_int(lower = 3, upper = 10),
+  num.trees     = p_int(lower = 300, upper = 1000)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "rsf_escenario2_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("rsf_escenario2_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_expresion,
+  test_data   = test_expresion,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "rsf_escenario2_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mtry          = best_params$mtry,
+  min_node      = best_params$min.node.size,
+  num_trees     = best_params$num.trees
+)
+
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 3
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "rsf",
+  backend = training_clinical_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.ranger", importance = "impurity")
+
+search_space <- ps(
+  mtry     = p_int(lower = 3, upper = 5),
+  min.node.size = p_int(lower = 3, upper = 10),
+  num.trees     = p_int(lower = 100, upper = 500)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "rsf_escenario3.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado:
+model_data <- readRDS("rsf_escenario3.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_at,
+  test_data   = test_clinical_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "rsf_escenario3",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mtry          = best_params$mtry,
+  min_node      = best_params$min.node.size,
+  num_trees     = best_params$num.trees
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 4
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "rsf",
+  backend = training_both_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.ranger", importance = "impurity")
+
+search_space <- ps(
+  mtry     = p_int(lower = 5, upper = 15),
+  min.node.size = p_int(lower = 3, upper = 10),
+  num.trees     = p_int(lower = 300, upper = 1000)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "rsf_escenario4_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("rsf_escenario4_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_bt,
+  test_data   = test_both_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "rsf_escenario4_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mtry          = best_params$mtry,
+  min_node      = best_params$min.node.size,
+  num_trees     = best_params$num.trees
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 5
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "rsf",
+  backend = training_both_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.ranger", importance = "impurity")
+
+search_space <- ps(
+  mtry     = p_int(lower = 5, upper = 16),
+  min.node.size = p_int(lower = 3, upper = 10),
+  num.trees     = p_int(lower = 300, upper = 1000)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "rsf_escenario5_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("rsf_escenario5_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_at,
+  test_data   = test_both_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "rsf_escenario5_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mtry          = best_params$mtry,
+  min_node      = best_params$min.node.size,
+  num_trees     = best_params$num.trees
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Survival SVM
+
+## Escenario 1
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "svm_surv",
+  backend = training_clinical_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+ 
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.svm", type = "regression", kernel = "lin_kernel")
+
+search_space <- ps(
+  mu = p_dbl(lower = 0.1, upper = 4),
+  gamma = p_dbl(lower = 0.1, upper = 4),
+  opt.meth = p_fct(levels = c("quadprog"))
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),  
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "svm_escenario1.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("svm_escenario1.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_bt,
+  test_data   = test_clinical_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "svm_escenario1",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mu            = best_params$mu,
+  gamma         = best_params$gamma
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 2
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "svm_surv",
+  backend = training_expresion,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.svm", type = "regression", kernel = "lin_kernel")
+
+search_space <- ps(
+  mu = p_dbl(lower = 0.1, upper = 4),
+  gamma = p_dbl(lower = 0.1, upper = 4),
+  opt.meth = p_fct(levels = c("quadprog"))
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),  
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "svm_escenario2_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("svm_escenario2_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_expresion,
+  test_data   = test_expresion,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "svm_escenario2_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mu            = best_params$mu,
+  gamma         = best_params$gamma
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 3
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "svm_surv",
+  backend = training_clinical_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+ 
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.svm", type = "regression", kernel = "lin_kernel")
+
+search_space <- ps(
+  mu = p_dbl(lower = 0.1, upper = 4),
+  gamma = p_dbl(lower = 0.1, upper = 4),
+  opt.meth = p_fct(levels = c("quadprog"))
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"), 
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "svm_escenario3.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("svm_escenario3.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_at,
+  test_data   = test_clinical_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "svm_escenario3",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mu            = best_params$mu,
+  gamma         = best_params$gamma
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 4
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "svm_surv",
+  backend = training_both_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.svm", type = "regression", kernel = "lin_kernel")
+
+search_space <- ps(
+  mu = p_dbl(lower = 0.1, upper = 4),
+  gamma = p_dbl(lower = 0.1, upper = 4),
+  opt.meth = p_fct(levels = c("quadprog"))
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),  # sin límite de tiempo
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "svm_escenario4_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("svm_escenario4_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_bt,
+  test_data   = test_both_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "svm_escenario4_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mu            = best_params$mu,
+  gamma         = best_params$gamma
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 5
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "svm_surv",
+  backend = training_both_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.svm", type = "regression", kernel = "lin_kernel")
+
+search_space <- ps(
+  mu = p_dbl(lower = 0.1, upper = 4),
+  gamma = p_dbl(lower = 0.1, upper = 4),
+  opt.meth = p_fct(levels = c("quadprog"))
+)
+
+# AutoTuner
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),  # sin límite de tiempo
+  tuner = tuner
+)
+
+# Entrenar con tuning automático
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "svm_escenario5_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("svm_escenario5_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_at,
+  test_data   = test_both_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "svm_escenario5_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  mu            = best_params$mu,
+  gamma         = best_params$gamma
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Hipótesis de riesgos proporcionales
+
+Dado que los siguientes modelos se basan en el modelo de Cox de riesgos proporcionales, partimos de la hipótesis fundamental de que el efecto de las variables predictoras sobre el riesgo es constante a lo largo del tiempo. Por ello, verificamos la validez de la hipótesis de riesgos proporcionales para cada una de las variables incluidas en el análisis. Aquellas variables que no cumplen esta suposición son descartadas, ya que su inclusión podría comprometer la validez del modelo.
+
+```{r}
+# Variables predictoras: 
+vars <- setdiff(names(test_both_at), c("OverallSurvival_days", "Death"))
+
+# Ajustamos un modelo de Cox: 
+model <- coxph(Surv(OverallSurvival_days,Death)~., data=training_both_at)
+  
+# Test de riesgos proporcionales: 
+zph <- cox.zph(model)
+
+# Mostramos los resultados: 
+print(zph)
+```
+
+```{r}
+# Eliminamos todas las que presentan un p-valor menor a 0.01 (vamos a volver a comprobar si incumple la hipótesis de PH): 
+incumplen <- c("C9orf72")
+
+validas <- setdiff(vars, incumplen)
+validas <- c(validas, "Death", "OverallSurvival_days")
+
+training_clinical_bt <- training_clinical_bt[,intersect(validas, names(training_clinical_bt))]
+training_clinical_at <- training_clinical_at[,intersect(validas, names(training_clinical_at))]
+training_expresion <- training_expresion[,intersect(validas,names(training_expresion))]
+training_both_bt <- training_both_bt[,intersect(validas,names(training_both_bt))]
+training_both_at <- training_both_at[,intersect(validas,names(training_both_at))]
+
+test_clinical_bt <- test_clinical_bt[,intersect(validas, names(test_clinical_bt))]
+test_clinical_at <- test_clinical_at[,intersect(validas, names(test_clinical_at))]
+test_expresion <- test_expresion[,intersect(validas,names(test_expresion))]
+test_both_bt <- test_both_bt[,intersect(validas,names(test_both_bt))]
+test_both_at <- test_both_at[,intersect(validas,names(test_both_at))]
+```
+
+```{r}
+# Codificación one-hot para BoneMetsNumber: 
+one_hot_encode <- function(df) {
+    # Creamos variables dummy (eliminamos intercepto): 
+    dummies <- model.matrix(~ BoneMetsNumber - 1, data = df)
+    # Eliminamos la variable original: 
+    df$BoneMetsNumber <- NULL
+    # Añadimos las variables dummy: 
+    df <- cbind(df, dummies)
+  return(df)
+}
+
+# Aplicamos a todos los datasets
+training_both_at    <- one_hot_encode(training_both_at)
+test_both_at        <- one_hot_encode(test_both_at)
+training_both_bt    <- one_hot_encode(training_both_bt)
+test_both_bt        <- one_hot_encode(test_both_bt)
+training_clinical_bt <- one_hot_encode(training_clinical_bt)
+test_clinical_bt     <- one_hot_encode(test_clinical_bt)
+training_clinical_at <- one_hot_encode(training_clinical_at)
+test_clinical_at     <- one_hot_encode(test_clinical_at)
+```
+
+```{r}
+# Actualizamos los conjuntos: 
+saveRDS(training_clinical_bt, "training_clinical_bt.rds")
+saveRDS(training_clinical_at, "training_clinical_at.rds")
+saveRDS(training_expresion, "training_expresion_gsea.rds")
+saveRDS(training_both_bt, "training_both_bt.rds")
+saveRDS(training_both_at, "training_both_at.rds")
+
+saveRDS(test_clinical_bt, "test_clinical_bt.rds")
+saveRDS(test_clinical_at, "test_clinical_at.rds")
+saveRDS(test_expresion, "test_expresion_gsea.rds")
+saveRDS(test_both_bt, "test_both_bt.rds")
+saveRDS(test_both_at, "test_both_at.rds")
+```
+
+# CoxBoost
+
+```{r}
+# Convertimos factores y caracteres a numéricos: 
+training_both_at[] <- lapply(training_both_at, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+
+test_both_at[] <- lapply(test_both_at, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+
+training_both_bt[] <- lapply(training_both_bt, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+
+test_both_bt[] <- lapply(test_both_bt, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+
+training_clinical_bt[] <- lapply(training_clinical_bt, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+
+test_clinical_bt[] <- lapply(test_clinical_bt, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+
+training_clinical_at[] <- lapply(training_clinical_at, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+
+test_clinical_at[] <- lapply(test_clinical_at, function(col) {
+  if (is.factor(col) || is.character(col)) {
+    return(as.numeric(as.factor(col)))
+  } else {
+    return(col)
+  }
+})
+```
+
+```{r}
+# Actualizamos los conjuntos: 
+saveRDS(training_clinical_bt, "training_clinical_bt.rds")
+saveRDS(training_clinical_at, "training_clinical_at.rds")
+saveRDS(training_expresion, "training_expresion.rds")
+saveRDS(training_both_bt, "training_both_bt.rds")
+saveRDS(training_both_at, "training_both_at.rds")
+
+saveRDS(test_clinical_bt, "test_clinical_bt.rds")
+saveRDS(test_clinical_at, "test_clinical_at.rds")
+saveRDS(test_expresion, "test_expresion.rds")
+saveRDS(test_both_bt, "test_both_bt.rds")
+saveRDS(test_both_at, "test_both_at.rds")
+```
+
+## Escenario 1
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "coxboost_surv",
+  backend = training_clinical_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.coxboost")
+search_space <- ps(
+  penalty = p_dbl(lower = 1, upper = 100),
+  stepno = p_int(lower = 50, upper = 200)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "coxboost_escenario1.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("coxboost_escenario1.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_bt,
+  test_data   = test_clinical_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "coxboost_escenario1",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  stepno        = best_params$stepno,
+  penalty       = best_params$penalty
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 2
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "coxboost_surv",
+  backend = training_expresion,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.coxboost")
+search_space <- ps(
+  penalty = p_dbl(lower = 1, upper = 100),
+  stepno = p_int(lower = 50, upper = 200)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "coxboost_escenario2_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("coxboost_escenario2_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_expresion,
+  test_data   = test_expresion,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "coxboost_escenario2_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  stepno        = best_params$stepno,
+  penalty       = best_params$penalty
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 3
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "coxboost_surv",
+  backend = training_clinical_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.coxboost", stepno = 100L)
+search_space <- ps(
+  penalty = p_dbl(lower = 1, upper = 100),
+  stepno = p_int(lower = 50, upper = 200)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "coxboost_escenario3.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("coxboost_escenario3.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_at,
+  test_data   = test_clinical_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "coxboost_escenario3",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  stepno        = best_params$stepno,
+  penalty       = best_params$penalty
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 4
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "coxboost_surv",
+  backend = training_both_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.coxboost")
+search_space <- ps(
+  penalty = p_dbl(lower = 1, upper = 100),
+  stepno = p_int(lower = 50, upper = 200)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "coxboost_escenario4_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("coxboost_escenario4_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_bt,
+  test_data   = test_both_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "coxboost_escenario4_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  stepno        = best_params$stepno,
+  penalty       = best_params$penalty
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 5
+
+```{r,eval=FALSE}
+# Crear el Task de supervivencia
+task <- TaskSurv$new(
+  id = "coxboost_surv",
+  backend = training_both_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.coxboost")
+
+search_space <- ps(
+  penalty = p_dbl(lower = 1, upper = 100),
+  stepno = p_int(lower = 50, upper = 200)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "coxboost_escenario5_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("coxboost_escenario5_gseab.rds")
+best_model   <- model_data$model
+best_learner <- model_data$learner
+best_params  <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_at,
+  test_data   = test_both_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "coxboost_escenario5_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  stepno        = best_params$stepno,
+  penalty       = best_params$penalty
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# DeepSurv
+
+## Escenario 1
+
+```{r,eval=FALSE}
+# Crear el Task de supervivencia
+task <- TaskSurv$new(
+  id = "deepsurv",
+  backend = training_clinical_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.deepsurv",
+  activation = "relu",
+  early_stopping = TRUE,
+  patience = 10,
+  epochs = 300,
+  optimizer = "adadelta",
+  num_nodes = c(8,4)
+) 
+
+search_space <- ps(
+  dropout = p_dbl(lower = 0.2, upper = 0.5),
+  lr = p_dbl(lower = 1e-4, upper = 5e-3, logscale = TRUE),
+  weight_decay = p_dbl(lower = 1e-4, upper = 1e-2, logscale = TRUE),
+  batch_size = p_int(lower = 8, upper = 16)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "deepsurv_escenario1.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("deepsurv_escenario1.rds")
+best_params  <- model_data$params
+
+# Entrenamos el modelo con los hiperparámetros óptimos: 
+learner <- lrn("surv.deepsurv")
+learner$param_set$values <- best_params
+task <- TaskSurv$new(
+  id = "expr_surv",
+  backend = training_clinical_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+best_learner <- learner$train(task)
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_bt,
+  test_data   = test_clinical_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "deepsurv_escenario1",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  dropout       = best_params$dropout,
+  lr            = best_params$lr,
+  weight_decay  = best_params$weight_decay,
+  batch_size    = best_params$batch_size
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Escenario 2
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "deepsurv",
+  backend = training_expresion,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.deepsurv",
+  activation = "relu",
+  early_stopping = TRUE,
+  patience = 10,
+  epochs = 300,
+  optimizer = "adadelta",
+  num_nodes = c(16,8)
+) 
+
+search_space <- ps(
+  dropout = p_dbl(lower = 0.2, upper = 0.5),
+  lr = p_dbl(lower = 1e-4, upper = 5e-3, logscale = TRUE),
+  weight_decay = p_dbl(lower = 1e-4, upper = 1e-2, logscale = TRUE),
+  batch_size = p_int(lower = 8, upper = 16)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "deepsurv_escenario2_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("deepsurv_escenario2_gseab.rds")
+best_params  <- model_data$params
+
+# Entrenamos el modelo con los hiperparámetros óptimos: 
+learner <- lrn("surv.deepsurv")
+learner$param_set$values <- best_params
+task <- TaskSurv$new(
+  id = "expr_surv",
+  backend = training_expresion,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+best_learner <- learner$train(task)
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_expresion,
+  test_data   = test_expresion,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "deepsurv_escenario2_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  dropout       = best_params$dropout,
+  lr            = best_params$lr,
+  weight_decay  = best_params$weight_decay,
+  batch_size    = best_params$batch_size
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Escenario 3
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "deepsurv",
+  backend = training_clinical_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.deepsurv",
+  activation = "relu",
+  early_stopping = TRUE,
+  patience = 10,
+  epochs = 300,
+  optimizer = "adadelta",
+  num_nodes = c(8,4)
+) 
+
+search_space <- ps(
+  dropout = p_dbl(lower = 0.2, upper = 0.5),
+  lr = p_dbl(lower = 1e-4, upper = 5e-3, logscale = TRUE),
+  weight_decay = p_dbl(lower = 1e-4, upper = 1e-2, logscale = TRUE),
+  batch_size = p_int(lower = 8, upper = 16)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "deepsurv_escenario3.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("deepsurv_escenario3.rds")
+best_params  <- model_data$params
+
+# Entrenamos el modelo con los hiperparámetros óptimos: 
+learner <- lrn("surv.deepsurv")
+learner$param_set$values <- best_params
+task <- TaskSurv$new(
+  id = "expr_surv",
+  backend = training_clinical_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+best_learner <- learner$train(task)
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_at,
+  test_data   = test_clinical_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "deepsurv_escenario3",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  dropout       = best_params$dropout,
+  lr            = best_params$lr,
+  weight_decay  = best_params$weight_decay,
+  batch_size    = best_params$batch_size
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Escenario 4
+
+```{r,eval=FALSE}
+# Crear el Task de supervivencia
+task <- TaskSurv$new(
+  id = "deepsurv",
+  backend = training_both_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.deepsurv",
+  activation = "relu",
+  early_stopping = TRUE,
+  patience = 10,
+  epochs = 300,
+  optimizer = "adadelta",
+  num_nodes = c(32,16)
+) 
+
+search_space <- ps(
+  dropout = p_dbl(lower = 0.2, upper = 0.5),
+  lr = p_dbl(lower = 1e-4, upper = 5e-3, logscale = TRUE),
+  weight_decay = p_dbl(lower = 1e-4, upper = 1e-2, logscale = TRUE),
+  batch_size = p_int(lower = 8, upper = 16)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "deepsurv_escenario4_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("deepsurv_escenario4_gseab.rds")
+best_params  <- model_data$params
+
+# Entrenamos el modelo con los hiperparámetros óptimos: 
+learner <- lrn("surv.deepsurv")
+learner$param_set$values <- best_params
+task <- TaskSurv$new(
+  id = "expr_surv",
+  backend = training_both_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+best_learner <- learner$train(task)
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_bt,
+  test_data   = test_both_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "deepsurv_escenario4_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  dropout       = best_params$dropout,
+  lr            = best_params$lr,
+  weight_decay  = best_params$weight_decay,
+  batch_size    = best_params$batch_size
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Escenario 5
+
+```{r,eval=FALSE}
+# Crear el Task de supervivencia
+task <- TaskSurv$new(
+  id = "deepsurv",
+  backend = training_both_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+# Creamos un resampling para que la validación cruzada sea reproducible: 
+resampling <- stratified_surv_cv(task, folds = 5)
+
+# Definir el learner CoxBoost
+learner <- lrn("surv.deepsurv",
+  activation = "relu",
+  early_stopping = TRUE,
+  patience = 10,
+  epochs = 300,
+  optimizer = "adadelta",
+  num_nodes = c(32,16)
+) 
+
+search_space <- ps(
+  dropout = p_dbl(lower = 0.2, upper = 0.5),
+  lr = p_dbl(lower = 1e-4, upper = 5e-3, logscale = TRUE),
+  weight_decay = p_dbl(lower = 1e-4, upper = 1e-2, logscale = TRUE),
+  batch_size = p_int(lower = 8, upper = 16)
+)
+
+at <- AutoTuner$new(
+  learner = learner,
+  resampling = resampling,
+  measure = measure,
+  search_space = search_space,
+  terminator = trm("none"),
+  tuner = tuner
+)
+
+at$train(task)
+
+# Modelo óptimo:
+best_learner <- at$learner$clone(deep = TRUE)  
+best_model   <- best_learner$model             
+best_params  <- best_learner$param_set$values  
+
+# Guardamos el modelo:
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "deepsurv_escenario5_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("deepsurv_escenario5_gseab.rds")
+best_params  <- model_data$params
+
+# Entrenamos el modelo con los hiperparámetros óptimos: 
+learner <- lrn("surv.deepsurv")
+learner$param_set$values <- best_params
+task <- TaskSurv$new(
+  id = "expr_surv",
+  backend = training_both_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+best_learner <- learner$train(task)
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_at,
+  test_data   = test_both_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "deepsurv_escenario5_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  dropout       = best_params$dropout,
+  lr            = best_params$lr,
+  weight_decay  = best_params$weight_decay,
+  batch_size    = best_params$batch_size
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Regresión de Cox
+
+## Escenario 1
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "cox_lasso",
+  backend = training_clinical_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.glmnet", alpha = 1, nlambda = 100)
+search_space <- ps(lambda = p_dbl(lower = 1e-4, upper = 1))
+
+at <- AutoTuner$new(
+  learner       = learner,
+  resampling    = resampling,
+  measure       = measure,
+  search_space  = search_space,
+  terminator    = trm("none"),
+  tuner         = tuner
+)
+
+at$train(task)
+
+best_learner <- at$learner$clone(deep = TRUE)
+best_model   <- best_learner$model
+best_params  <- best_learner$param_set$values
+
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "cox_escenario1.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("cox_escenario1.rds")
+best_learner <- model_data$learner
+best_params <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_bt,
+  test_data   = test_clinical_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "cox_escenario1",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  lambda        = best_params$lambda
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 2
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "cox_lasso",
+  backend = training_expresion,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+# Creamos un resampling para que la validación cruzada sea reproducible: 
+resampling <- stratified_surv_cv(task, folds = 5)
+
+learner <- lrn("surv.glmnet", alpha = 1, nlambda = 100)
+
+search_space <- ps(lambda = p_dbl(lower = 1e-4, upper = 1))
+
+at <- AutoTuner$new(
+  learner       = learner,
+  resampling    = resampling,
+  measure       = measure,
+  search_space  = search_space,
+  terminator    = trm("none"),
+  tuner         = tuner
+)
+
+at$train(task)
+
+best_learner <- at$learner$clone(deep = TRUE)
+best_model   <- best_learner$model
+best_params  <- best_learner$param_set$values
+
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "cox_escenario2_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("cox_escenario2_gseab.rds")
+best_learner <- model_data$learner
+best_params <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_expresion,
+  test_data   = test_expresion,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "cox_escenario2_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  lambda        = best_params$lambda
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 3
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "cox_lasso",
+  backend = training_clinical_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.glmnet", alpha = 1, nlambda = 100)
+
+search_space <- ps(lambda = p_dbl(lower = 1e-4, upper = 1))
+
+at <- AutoTuner$new(
+  learner       = learner,
+  resampling    = resampling,
+  measure       = measure,
+  search_space  = search_space,
+  terminator    = trm("none"),
+  tuner         = tuner
+)
+
+at$train(task)
+
+best_learner <- at$learner$clone(deep = TRUE)
+best_model   <- best_learner$model
+best_params  <- best_learner$param_set$values
+
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "cox_escenario3.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("cox_escenario3.rds")
+best_learner <- model_data$learner
+best_params <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_clinical_at,
+  test_data   = test_clinical_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "cox_escenario3",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  lambda        = best_params$lambda
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 4
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "cox_lasso",
+  backend = training_both_bt,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+resampling <- stratified_surv_cv(task, folds = 5)
+learner <- lrn("surv.glmnet", alpha = 1, nlambda = 100)
+
+search_space <- ps(lambda = p_dbl(lower = 1e-4, upper = 1))
+
+at <- AutoTuner$new(
+  learner       = learner,
+  resampling    = resampling,
+  measure       = measure,
+  search_space  = search_space,
+  terminator    = trm("none"),
+  tuner         = tuner
+)
+
+at$train(task)
+
+best_learner <- at$learner$clone(deep = TRUE)
+best_model   <- best_learner$model
+best_params  <- best_learner$param_set$values
+
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "cox_escenario4_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("cox_escenario4_gseab.rds")
+best_learner <- model_data$learner
+best_params <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_bt,
+  test_data   = test_both_bt,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "cox_escenario4_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  lambda        = best_params$lambda
+)
+
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+## Escenario 5
+
+```{r,eval=FALSE}
+task <- TaskSurv$new(
+  id = "cox_lasso",
+  backend = training_both_at,
+  time = "OverallSurvival_days",
+  event = "Death"
+)
+
+learner <- lrn("surv.glmnet", alpha = 1, nlambda = 100)
+search_space <- ps(lambda = p_dbl(lower = 1e-4, upper = 1))
+
+at <- AutoTuner$new(
+  learner       = learner,
+  resampling    = resampling,
+  measure       = measure,
+  search_space  = search_space,
+  terminator    = trm("none"),
+  tuner         = tuner
+)
+
+at$train(task)
+
+best_learner <- at$learner$clone(deep = TRUE)
+best_model   <- best_learner$model
+best_params  <- best_learner$param_set$values
+
+saveRDS(
+  list(model = best_model, learner = best_learner, params = best_params),
+  file = "cox_escenario5_gseab.rds"
+)
+```
+
+```{r}
+# Cargamos el modelo entrenado: 
+model_data <- readRDS("cox_escenario5_gseab.rds")
+best_learner <- model_data$learner
+best_params <- model_data$params
+
+results <- score_survival_metrics(
+  learner     = best_learner,
+  train_data  = training_both_at,
+  test_data   = test_both_at,
+  time_col    = "OverallSurvival_days",
+  event_col   = "Death",
+  plot_roc    = TRUE
+)
+
+result_row <- data.frame(
+  escenario     = "cox_escenario5_gseab",
+  cindex_train  = results$cindex$train,
+  cindex_test   = results$cindex$test,
+  auc1_train    = results$auc_1yr$train,
+  auc1_test     = results$auc_1yr$test,
+  auc2_train    = results$auc_2yr$train,
+  auc2_test     = results$auc_2yr$test,
+  lambda        = best_params$lambda
+)
+
+# Mostramos los resultados: 
+print(result_row)
+results_matrix <- bind_rows(results_matrix, result_row)
+```
+
+# Matriz de resultados
+
+```{r}
+# Guardamos la matriz de resultados: 
+saveRDS(results_matrix, "resultados_gseab.rds")
+print(results_matrix)
+```

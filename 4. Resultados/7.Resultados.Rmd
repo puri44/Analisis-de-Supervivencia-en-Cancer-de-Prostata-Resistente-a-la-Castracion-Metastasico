@@ -1,0 +1,836 @@
+---
+title: "Análisis de resultados"
+output: html_document
+date: "2025-06-04"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Configuración inicial 
+```{r}
+# Lista de paquetes requeridos: 
+list.of.packages <- c(
+  "dplyr",
+  "tidyverse",
+  "tidytext",
+  "purrr",
+  "PMCMRplus",
+  "tibble",
+  "mlr3",
+  "mlr3proba",
+  "mlr3misc",
+  "mlr3learners",
+  "mlr3tuning",
+  "mlr3pipelines",
+  "mlr3extralearners",
+  "mlr3filters",
+  "mlr3measures",
+  "survivalsvm",
+  "survC1",
+  "forcats"
+)
+
+# Función para instalar y cargar los paquetes: 
+ipak <- function(pkg) {
+  new.pkg <- pkg[!(pkg %in% installed.packages()[, "Package"])]
+  if (length(new.pkg)) {
+    install.packages(new.pkg, dependencies = TRUE)
+  }
+  invisible(sapply(pkg, require, character.only = TRUE))
+}
+
+
+ipak(list.of.packages)
+
+rm(list.of.packages, ipak)
+
+# Fijamos la semilla para reproducibilidad: 
+set.seed(123)
+```
+
+```{r}
+# Cambiamos el tipo de letra a Times New Roman: 
+windowsFonts(`Times New Roman` = windowsFont("Times New Roman"))
+```
+
+Cargamos los resultados extraídos en los scripts anteriores.
+
+```{r}
+# Cargamos los resultados: 
+resultados_gseab <- readRDS("resultados_gseab.rds")
+resultados_gseac <- readRDS("resultados_gseac.rds")
+resultados_rfb <- readRDS("resultados_rfb.rds")
+resultados_rfc <- readRDS("resultados_rfc.rds")
+
+# Unimos los resultados: 
+resultados_todos <- bind_rows(
+  resultados_gseab,
+  resultados_gseac,
+  resultados_rfb,
+  resultados_rfc
+)
+```
+
+```{r}
+# Modificamos el dataset de resultados para añadir el escenario, el modelo, el tipo de selección, el tipo de integración y el experimento: 
+resultados_todos <- resultados_todos %>%
+  mutate(
+    modelo      = str_extract(escenario, "^[^_]+"),
+    escenario_n = str_extract(escenario, "(?<=escenario)\\d+") %>% as.integer(),
+    seleccion   = str_extract(escenario, "_(gsea|rf)") %>% str_remove("^_"),
+    sufijo      = str_extract(escenario, "[a-z]$"),
+    
+    integracion = case_when(
+      escenario_n >= 4 & sufijo == "b" ~ "Dos_etapas",
+      escenario_n >= 4 & sufijo == "c" ~ "Apilada",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Mantenemos solo el sufijo 'b' en el escenario 2 (porque son iguales): 
+  filter(!(escenario_n %in% 2 & sufijo == "c")) %>%
+
+  mutate(
+    exp_id = case_when(
+      escenario_n == 1 ~ "EXP1",
+      escenario_n == 2 & seleccion == "gsea" ~ "EXP2",
+      escenario_n == 2 & seleccion == "rf"   ~ "EXP3",
+      escenario_n == 3 ~ "EXP4",
+      escenario_n == 4 & seleccion == "gsea" & integracion == "Dos_etapas"  ~ "EXP5",
+      escenario_n == 4 & seleccion == "gsea" & integracion == "Apilada" ~ "EXP6",
+      escenario_n == 4 & seleccion == "rf"   & integracion == "Dos_etapas"  ~ "EXP7",
+      escenario_n == 4 & seleccion == "rf"   & integracion == "Apilada" ~ "EXP8",
+      escenario_n == 5 & seleccion == "gsea" & integracion == "Dos_etapas"  ~ "EXP9",
+      escenario_n == 5 & seleccion == "gsea" & integracion == "Apilada" ~ "EXP10",
+      escenario_n == 5 & seleccion == "rf"   & integracion == "Dos_etapas"  ~ "EXP11",
+      escenario_n == 5 & seleccion == "rf"   & integracion == "Apilada" ~ "EXP12",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(exp_id))
+
+
+resultados_todos <- resultados_todos %>%
+  mutate(
+    integracion = if_else(escenario_n %in% c(2), NA_character_, integracion)
+  )
+```
+
+```{r}
+write_csv(resultados_todos, "resultados_todos.csv")
+```
+
+# O1. Comparación de modelos
+
+```{r}
+# Seleccionamos los mejores modelos para cada escenario: 
+mejores_modelos <- resultados_todos %>%
+  group_by(escenario_n) %>%
+  slice_max(order_by = cindex_test, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+mejores_modelos
+```
+
+Cargamos los mejores modelos y los evaluamos sobre la cohorte IRST. Almacenamos el learner de cada modelo en una variable, creamos la task corresponciente para evaluar sobre el conjunto de test y realizamos las predicciones sobre dicho dataset. 
+
+```{r}
+svm_esc1 <- readRDS("svm_escenario1.rds")
+test1 <- readRDS("test_clinical_bt_prev.rds")
+test1$Death <- as.numeric(test1$Death)
+esc1_learner <- svm_esc1$learner
+task_test_esc1  <- TaskSurv$new(id = "test",  backend = test1,  time = "OverallSurvival_days", event = "Death")
+pred_esc1  <- esc1_learner$predict(task_test_esc1)
+scores_esc1 <- scale(pred_esc1$crank)
+
+coxboost_esc2_gseab <- readRDS("coxboost_escenario2_gseab.rds")
+test2 <- readRDS("test_expresion.rds")
+test2$Death <- as.numeric(test2$Death)
+esc2_learner <- coxboost_esc2_gseab$learner
+task_test_esc2  <- TaskSurv$new(id = "test",  backend = test2,  time = "OverallSurvival_days", event = "Death")
+pred_esc2  <- esc2_learner$predict(task_test_esc2)
+scores_esc2 <- scale(pred_esc2$crank)
+
+svm_esc3 <- readRDS("svm_escenario3.rds")
+test3 <- readRDS("test_clinical_at_prev.rds")
+test3$Death <- as.numeric(test3$Death)
+esc3_learner <- svm_esc3$learner
+task_test_esc3  <- TaskSurv$new(id = "test",  backend = test3,  time = "OverallSurvival_days", event = "Death")
+pred_esc3  <- esc3_learner$predict(task_test_esc3)
+scores_esc3 <- scale(pred_esc3$crank)
+
+svm_esc4_rfb <- readRDS("svm_escenario4_rfb.rds")
+test4 <- readRDS("test_both_bt_rf_prev.rds")
+test4$Death <- as.numeric(test4$Death)
+esc4_learner <- svm_esc4_rfb$learner
+task_test_esc4  <- TaskSurv$new(id = "test",  backend = test4,  time = "OverallSurvival_days", event = "Death")
+pred_esc4  <- esc4_learner$predict(task_test_esc4)
+scores_esc4 <- scale(pred_esc4$crank)
+
+rsf_esc5_gseab <- readRDS("rsf_escenario5_gseab.rds")
+test5 <- readRDS("test_both_at_gsea_prev.rds")
+test5$Death <- as.numeric(test5$Death)
+esc5_learner <- rsf_esc5_gseab$learner
+task_test_esc5  <- TaskSurv$new(id = "test",  backend = test5,  time = "OverallSurvival_days", event = "Death")
+pred_esc5  <- esc5_learner$predict(task_test_esc5)
+scores_esc5 <- scale(pred_esc5$crank)
+```
+
+## Contrastes de Wilcoxon de rangos con signo por pares (para cada hipótesis)
+
+### H1
+```{r}
+wilcox.test(scores_esc1, scores_esc3, paired = TRUE, alternative = "two.sided")
+```
+
+### H2
+```{r}
+wilcox.test(scores_esc4, scores_esc5, paired = TRUE, alternative = "two.sided")
+```
+
+### H3
+```{r}
+wilcox.test(scores_esc2, scores_esc4, paired = TRUE, alternative = "two.sided")
+wilcox.test(scores_esc2, scores_esc5, paired = TRUE, alternative = "two.sided")
+```
+
+### H4
+```{r}
+wilcox.test(scores_esc1, scores_esc4, paired = TRUE, alternative = "two.sided")
+```
+
+### H5
+```{r}
+wilcox.test(scores_esc3, scores_esc5, paired = TRUE, alternative = "two.sided")
+```
+
+### H6
+```{r}
+wilcox.test(scores_esc2, scores_esc3, paired = TRUE, alternative = "two.sided")
+```
+
+## Gráfico adicional
+
+```{r}
+# Obtenemos el mejor resultado por modelo y escenario: 
+mejores_por_modelo_escenario <- resultados_todos %>%
+  filter(!is.na(modelo), !is.na(escenario_n)) %>%
+  group_by(modelo, escenario_n) %>%
+  slice_max(order_by = cindex_test, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Preparamos las etiquetas:
+mejores_por_modelo_escenario <- mejores_por_modelo_escenario %>%
+  mutate(escenario = paste0("Esc", escenario_n),
+         modelo = factor(modelo, levels = c("cox", "coxboost", "svm", "rsf", "deepsurv")))
+
+# Gráfico de líneas (comparación por modelo a través de escenarios): 
+ggplot(mejores_por_modelo_escenario,
+       aes(x = escenario, y = cindex_test, group = modelo, color = modelo)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c(
+    "cox" = "#66C2A5",
+    "coxboost" = "#6A51A3",
+    "svm" = "#9E9AC8",
+    "rsf" = "#1B9E77",
+    "deepsurv" = "#4A1486"
+  )) +
+  labs(x = "Escenario", y = "C-Index (test)", color = "Modelo") +
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Times New Roman"))
+```
+
+# O2. Técnicas de selección de variables
+
+```{r}
+# Gráfico de violín del C-Index según la estrategia de selección:  
+df_sel <- resultados_todos %>%
+  filter(escenario_n %in% 2:5, seleccion %in% c("gsea", "rf")) %>%
+  mutate(seleccion = recode(seleccion,
+                            "gsea" = "GSEA",
+                            "rf"   = "RF-imp"))
+
+ggplot(df_sel,
+       aes(seleccion, cindex_test,
+           colour = seleccion, fill = seleccion)) +
+  geom_violin(alpha = .25, trim = FALSE) +
+  geom_jitter(width = .1, size = 2, alpha = .7) +
+  facet_wrap(~escenario_n,
+             labeller = labeller(escenario_n = function(x) paste0("Esc-", x))) +
+  scale_colour_manual(values = c(
+    "GSEA" = "#1B9E77",     # verde
+    "RF-imp" = "#6A51A3"    # morado
+  ), guide = "none") +
+  scale_fill_manual(values = c(
+    "GSEA" = "#A1D99B",
+    "RF-imp" = "#CBC9E2"
+  ), guide = "none") +
+  labs(x = "Selección", y = "C-Index (conjunto de test)") +
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Times New Roman"))
+```
+
+```{r}
+# Gráfico de violín del AUC a 1 y 2 años según la estrategia de selección:  
+df_sel_auc <- resultados_todos %>%
+  filter(escenario_n %in% 2:5, seleccion %in% c("gsea", "rf")) %>%
+  mutate(seleccion = recode(seleccion,
+                            "gsea" = "GSEA",
+                            "rf"   = "RF-imp")) %>%
+  select(escenario_n, seleccion, auc1_test, auc2_test) %>%
+  pivot_longer(cols = c(auc1_test, auc2_test),
+               names_to = "tiempo", values_to = "auc") %>%
+  mutate(
+    tiempo = recode(tiempo,
+                    auc1_test = "AUC (1 año)",
+                    auc2_test = "AUC (2 años)"),
+    facet_id = factor(paste0("E", escenario_n, "·", tiempo),
+                      levels = c(
+                        "E2·AUC (1 año)", "E2·AUC (2 años)",
+                        "E3·AUC (1 año)", "E3·AUC (2 años)",
+                        "E4·AUC (1 año)", "E4·AUC (2 años)",
+                        "E5·AUC (1 año)", "E5·AUC (2 años)"
+                      ))
+  )
+
+
+ggplot(df_sel_auc,
+       aes(seleccion, auc,
+           colour = seleccion, fill = seleccion)) +
+  geom_violin(alpha = .25, trim = FALSE) +
+  geom_jitter(width = .1, size = 2, alpha = .7) +
+  facet_wrap(~ facet_id, nrow = 1) +
+  scale_colour_manual(values = c(
+    "GSEA" = "#1B9E77",
+    "RF-imp" = "#6A51A3"
+  ), guide = "none") +
+  scale_fill_manual(values = c(
+    "GSEA" = "#A1D99B",
+    "RF-imp" = "#CBC9E2"
+  ), guide = "none") +
+  labs(x = "Selección", y = "AUC (conjunto de test)") +
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Times New Roman"))
+```
+
+```{r}
+# Comparación directa GSEA vs RF-imp en C-Index: 
+comparacion_seleccion <- resultados_todos %>% 
+  select(modelo, escenario_n, seleccion, integracion, cindex_test) %>% 
+  pivot_wider(names_from = seleccion, values_from = cindex_test) %>%
+  drop_na(gsea, rf) %>%  # solo pares comparables
+  mutate(
+    ganador = case_when(
+      gsea > rf  ~ "GSEA",
+      rf > gsea  ~ "RF-imp",
+      TRUE       ~ "Empate"
+    ),
+    diferencia = gsea - rf
+  )
+
+# Test de Wilcoxon pareado: 
+wilcox.test(comparacion_seleccion$diferencia, alternative = "two.sided")
+```
+
+```{r}
+# Comparación directa GSEA vs RF-imp en C-Index: 
+comparacion_auc1 <- resultados_todos %>% 
+  select(modelo, escenario_n, seleccion, integracion, auc1_test) %>% 
+  pivot_wider(names_from = seleccion, values_from = auc1_test) %>%
+  drop_na(gsea, rf) %>%  # pares comparables
+  mutate(
+    ganador = case_when(
+      gsea > rf  ~ "GSEA",
+      rf > gsea  ~ "RF-imp",
+      TRUE       ~ "Empate"
+    ),
+    diferencia = gsea - rf
+  )
+
+# Test de Wilcoxon pareado: 
+wilcox.test(comparacion_auc1$diferencia, alternative = "two.sided")
+```
+
+```{r}
+# Comparación directa GSEA vs RF-imp en C-Index: 
+comparacion_auc2 <- resultados_todos %>% 
+  select(modelo, escenario_n, seleccion, integracion, auc2_test) %>% 
+  pivot_wider(names_from = seleccion, values_from = auc2_test) %>%
+  drop_na(gsea, rf) %>% 
+  mutate(
+    ganador = case_when(
+      gsea > rf  ~ "GSEA",
+      rf > gsea  ~ "RF-imp",
+      TRUE       ~ "Empate"
+    ),
+    diferencia = gsea - rf
+  )
+
+# Test de Wilcoxon pareado: 
+wilcox.test(comparacion_auc2$diferencia, alternative = "two.sided")
+```
+
+# O3. Integración multi-ómica
+
+```{r}
+# Visualización del C-Index por método de integración multi-ómica: 
+df_int <- resultados_todos %>% 
+            filter(escenario_n %in% 4:5, integracion %in% c("Dos_etapas", "Apilada"))
+
+ggplot(df_int,
+       aes(integracion, cindex_test,
+           colour = integracion, fill = integracion)) +
+  geom_violin(alpha = .25, trim = FALSE) +
+  geom_jitter(width = .1, size = 2, alpha = .7) +
+  facet_wrap(~escenario_n,
+             labeller = labeller(escenario_n = function(x) paste0("Esc-", x))) +
+  scale_colour_manual(values = c(
+    "Dos_etapas" = "#1B9E77",   # verde intenso
+    "Apilada" = "#6A51A3"   # morado medio
+  ), guide = "none") +
+  scale_fill_manual(values = c(
+    "Dos_etapas" = "#A1D99B",   # verde claro
+    "Apilada" = "#CBC9E2"   # morado claro
+  ), guide = "none") +
+  labs(x = "Integración", y = "C-Index (conjunto de test)") +
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Times New Roman"))
+```
+
+```{r}
+# Visualización del AUC (1 y 2 años) por método de integración multi-ómica: 
+df_auc <- resultados_todos %>%
+  filter(escenario_n %in% 4:5, integracion %in% c("Dos_etapas", "Apilada")) %>%
+  select(escenario_n, integracion, auc1_test, auc2_test) %>%
+  pivot_longer(cols = c(auc1_test, auc2_test),
+               names_to = "tiempo", values_to = "auc") %>%
+  mutate(
+    tiempo = recode(tiempo,
+                    auc1_test = "AUC (1 año)",
+                    auc2_test = "AUC (2 años)"),
+    facet_id = factor(paste0("Esc-", escenario_n, " · ", tiempo),
+                      levels = c("Esc-4 · AUC (1 año)", "Esc-4 · AUC (2 años)",
+                                 "Esc-5 · AUC (1 año)", "Esc-5 · AUC (2 años)"))
+  )
+
+ggplot(df_auc,
+       aes(x = integracion, y = auc,
+           colour = integracion, fill = integracion)) +
+  geom_violin(alpha = .25, trim = FALSE) +
+  geom_jitter(width = .1, size = 2, alpha = .7) +
+  facet_wrap(~ facet_id, nrow = 1) +
+  scale_colour_manual(values = c(
+    "Dos_etapas" = "#1B9E77",
+    "Apilada" = "#6A51A3"
+  ), guide = "none") +
+  scale_fill_manual(values = c(
+    "Dos_etapas" = "#A1D99B",
+    "Apilada" = "#CBC9E2"
+  ), guide = "none") +
+  labs(x = "Integración", y = "AUC (conjunto de test)") +
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Times New Roman"))
+```
+
+```{r}
+# Comparación pareada de C-Index entre integraciones (Dos_etapas vs Apilada): 
+comparaciones <- resultados_todos %>% 
+  filter(!is.na(integracion)) %>%                         
+  select(modelo, escenario_n, seleccion, integracion, cindex_test) %>% 
+  pivot_wider(names_from = integracion, values_from = cindex_test) %>%              
+  drop_na(Dos_etapas, Apilada) %>%                           
+  mutate(
+    ganador = case_when(
+      Dos_etapas  > Apilada ~ "Dos_etapas",
+      Apilada > Dos_etapas  ~ "Apilada",
+      TRUE              ~ "Empate"
+    ),
+    diferencia = Dos_etapas - Apilada
+  )
+
+# Test de los rangos con signo de Wilcoxon pareado: 
+wilcox.test(comparaciones$diferencia, alternative = "two.sided")
+```
+
+```{r}
+# Comparación pareada de AUC a 1 año: 
+comparaciones_auc1 <- resultados_todos %>% 
+  filter(!is.na(integracion)) %>%                         
+  select(modelo, escenario_n, seleccion, integracion, auc1_test) %>% 
+  pivot_wider(names_from = integracion, values_from = auc1_test) %>%              
+  drop_na(Dos_etapas, Apilada) %>%                           
+  mutate(
+    ganador = case_when(
+      Dos_etapas  > Apilada ~ "Dos_etapas",
+      Apilada > Dos_etapas  ~ "Apilada",
+      TRUE              ~ "Empate"
+    ),
+    diferencia = Dos_etapas - Apilada
+  )
+
+# Test de los rangos con signo de Wilcoxon pareado: 
+wilcox.test(comparaciones_auc1$diferencia, alternative = "two.sided")
+```
+
+```{r}
+# Comparación pareada de AUC a 2 años: 
+comparaciones_auc2 <- resultados_todos %>% 
+  filter(!is.na(integracion)) %>%                         
+  select(modelo, escenario_n, seleccion, integracion, auc2_test) %>% 
+  pivot_wider(names_from = integracion, values_from = auc2_test) %>%              
+  drop_na(Dos_etapas, Apilada) %>%                           
+  mutate(
+    ganador = case_when(
+      Dos_etapas  > Apilada ~ "Dos_etapas",
+      Apilada > Dos_etapas  ~ "Apilada",
+      TRUE              ~ "Empate"
+    ),
+    diferencia = Dos_etapas - Apilada
+  )
+
+# Test de los rangos con signo de Wilcoxon pareado:
+wilcox.test(comparaciones_auc2$diferencia, alternative = "two.sided")
+```
+
+# O4. Comparación de modelos
+
+## Gráficos
+
+```{r}
+resultados_todos <- resultados_todos %>%
+  mutate(exp_n = as.integer(gsub("\\D", "", exp_id))) %>%
+  arrange(exp_n) %>%
+  mutate(exp_id = factor(exp_id, levels = unique(exp_id))) %>%
+  select(-exp_n)
+
+# C-Index (test) por modelo en cada experimento: 
+ggplot(resultados_todos,
+       aes(x = reorder(modelo, cindex_test), y = cindex_test, fill = modelo)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~exp_id, ncol = 4) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "cox"      = "#66C2A5",  # verde suave
+    "rsf"      = "#1B9E77",  # verde intenso
+    "svm"      = "#9E9AC8",  # morado claro
+    "coxboost" = "#6A51A3",  # morado medio
+    "deepsurv" = "#4A1486"   # morado oscuro
+  )) +
+  labs(x = NULL, y = "C-Index") +
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Times New Roman"))
+```
+```{r}
+# Cambiamos el formato: 
+resultados_auc_largo <- resultados_todos %>%
+  select(exp_id, modelo, auc1_test, auc2_test) %>%
+  pivot_longer(cols = c(auc1_test, auc2_test),
+               names_to = "tiempo",
+               values_to = "auc") %>%
+  mutate(tiempo = recode(tiempo,
+                         auc1_test = "1 año",
+                         auc2_test = "2 años"))
+
+resultados_auc_largo <- resultados_auc_largo %>%
+  mutate(
+    modelo = factor(modelo, levels = c("deepsurv","cox","coxboost","svm", "rsf"))
+  )
+
+# AUC por modelo e instante temporal en cada experimento: 
+ggplot(resultados_auc_largo,
+       aes(x = modelo, y = auc, fill = modelo, alpha = tiempo)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  facet_wrap(~exp_id, ncol = 4) +
+  coord_flip() +
+  labs(x = NULL, y = "AUC", fill = "Modelo", alpha = "Tiempo") +
+  theme_minimal(base_size = 12) +
+  theme(text = element_text(family = "Times New Roman"),
+        legend.position = "bottom") +
+  scale_fill_manual(values = c(
+    "cox"      = "#66C2A5",   # verde suave
+    "rsf"      = "#1B9E77",   # verde intenso
+    "svm"      = "#9E9AC8",   # morado claro
+    "coxboost" = "#6A51A3",   # morado medio
+    "deepsurv" = "#4A1486"    # morado oscuro
+  )) +
+  scale_alpha_manual(values = c(
+    "1 año"  = 0.6,
+    "2 años" = 1.0
+  ))
+```
+
+## Test de Friedman y tests post-hoc de Nemenyi - CIndex
+
+```{r}
+# Rankeamos los modelos por experimento: 
+ranking_data <- resultados_todos %>%
+  group_by(exp_id) %>%
+  mutate(ranking = rank(cindex_test, ties.method = "average")) %>%  # mayor C-Index = mejor (correcto)
+  ungroup()
+
+# Creamos una matriz con filas = experimentos, columnas = modelos. 
+matriz_ranks <- ranking_data %>%
+  select(exp_id, modelo, ranking) %>%
+  pivot_wider(names_from = modelo, values_from = ranking) %>%
+  column_to_rownames("exp_id")
+
+# Aplicamos el test de Friedman: 
+friedman_result <- friedmanTest(as.matrix(matriz_ranks))
+print(friedman_result)
+```
+
+Puesto que el test de Friedman nos llevó a rechazar la hipótesis nula, realizamos tests post-hoc de Nemenyi para comparar cada par de modelos.
+
+```{r}
+# Tests post-hoc de Nemenyi: 
+nemenyi_result <- frdAllPairsNemenyiTest(as.matrix(matriz_ranks))
+summary(nemenyi_result)
+```
+
+## Test de Friedman y tests post-hoc de Nemenyi - AUC a 1 y 2 años
+
+```{r}
+ranking_auc1 <- resultados_todos %>%
+  group_by(exp_id) %>%
+  mutate(ranking = rank(-auc1_test, ties.method = "average")) %>%
+  ungroup()
+
+matriz_auc1 <- ranking_auc1 %>%
+  select(exp_id, modelo, ranking) %>%
+  pivot_wider(names_from = modelo, values_from = ranking) %>%
+  column_to_rownames("exp_id")
+
+# Test de Friedman: 
+friedman_auc1 <- friedmanTest(as.matrix(matriz_auc1))
+print(friedman_auc1)
+```
+
+```{r}
+# Tests de Nemenyi:
+nemenyi_auc1 <- frdAllPairsNemenyiTest(as.matrix(matriz_auc1))
+summary(nemenyi_auc1)
+```
+
+```{r}
+ranking_auc2 <- resultados_todos %>%
+  group_by(exp_id) %>%
+  mutate(ranking = rank(-auc2_test, ties.method = "average")) %>%
+  ungroup()
+
+matriz_auc2 <- ranking_auc2 %>%
+  select(exp_id, modelo, ranking) %>%
+  pivot_wider(names_from = modelo, values_from = ranking) %>%
+  column_to_rownames("exp_id")
+
+# Test de Friedman: 
+friedman_auc2 <- friedmanTest(as.matrix(matriz_auc2))
+print(friedman_auc2)
+```
+
+```{r}
+# Tests de Nemenyi: 
+nemenyi_auc2 <- frdAllPairsNemenyiTest(as.matrix(matriz_auc2))
+summary(nemenyi_auc2)
+```
+
+# O5. Importancia de las variables
+
+```{r}
+# Seleccionamos los modelos con CIndex > 0.7y AUC > 0.75 en ambos instantes: 
+modelos_buenos <- resultados_todos %>%
+  filter(cindex_test > 0.7, auc1_test > 0.75, auc2_test > 0.75)
+
+print(modelos_buenos)
+```
+
+```{r}
+# Cargamos los modelos RSF seleccionados: 
+nombres_modelos <- c(
+  "rsf_escenario4_gseab.rds",
+  "rsf_escenario5_gseab.rds",
+  "rsf_escenario4_gseac.rds",
+  "rsf_escenario5_gseac.rds"
+)
+
+# Nombres de experimentos correspondientes: 
+nombres_experimentos <- c("EXP5", "EXP6", "EXP9", "EXP10")
+modelos_cargados <- lapply(nombres_modelos, readRDS)
+names(modelos_cargados) <- nombres_experimentos
+```
+
+```{r}
+# Calculamos las importancias solo para modelos RSF (ranger): 
+importancias_rsf <- map_dfr(names(modelos_cargados), function(nombre) {
+  modelo <- modelos_cargados[[nombre]]
+  
+  if (inherits(modelo$learner$model, "ranger")) {
+    imp <- modelo$learner$model$variable.importance
+    tibble(
+      modelo = nombre,
+      variable = names(imp),
+      importancia = as.numeric(imp)
+    )
+  } else {
+    NULL
+  }
+})
+```
+
+```{r}
+importancias_rsf %>%
+  filter(modelo %in% c("EXP5", "EXP6", "EXP9", "EXP10")) %>%
+  group_by(modelo) %>%
+  slice_max(order_by = importancia, n = 10) %>%
+  ungroup() %>%
+  mutate(
+    variable_facet = fct_reorder(interaction(modelo, variable), importancia),
+    variable_label = str_remove(as.character(variable_facet), "^.*\\.")  # limpia el nombre
+  ) %>%
+  ggplot(aes(x = variable_facet, y = importancia, fill = modelo)) +
+    geom_col(show.legend = FALSE) +
+    facet_wrap(~ modelo, scales = "free_y", nrow = 1) +
+    coord_flip() +
+    scale_x_discrete(labels = function(x) str_remove(x, "^.*\\.")) +
+    scale_fill_manual(values = c(
+      "EXP5"  = "#1B9E77",
+      "EXP6"  = "#A1D99B",
+      "EXP9"  = "#6A51A3",
+      "EXP10" = "#CBC9E2"
+    )) +
+    labs(
+      x = "Variable",
+      y = "Importancia"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      panel.spacing.x = unit(6, "pt"),
+      axis.text.x = element_blank()
+    )
+```
+
+```{r}
+# Cargamos los modelos Survival-SVM seleccionados: 
+nombres_modelos_svm <- c(
+  "svm_escenario4_gseab.rds",
+  "svm_escenario4_rfb.rds",
+  "svm_escenario5_rfb.rds"
+)
+
+# Nombres de experimento correspondientes: 
+nombres_experimentos_svm <- c("EXP5", "EXP7", "EXP11")
+
+modelos_cargados_svm <- lapply(nombres_modelos_svm, readRDS)
+names(modelos_cargados_svm) <- nombres_experimentos_svm
+learners_svm <- lapply(modelos_cargados_svm, `[[`, "learner")
+```
+
+```{r}
+# Cargamos los conjuntos de test correspondientes: 
+test_svm_exp5 <- readRDS("test_both_bt_gsea_prev.rds")
+test_svm_exp7 <- readRDS("test_both_bt_rf_prev.rds")
+test_svm_exp11 <- readRDS("test_both_at_rf_prev.rds")
+
+test_sets <- list(
+  EXP5  = readRDS("test_both_bt_gsea_prev.rds"),
+  EXP7  = readRDS("test_both_bt_rf_prev.rds"),
+  EXP11 = readRDS("test_both_at_rf_prev.rds")
+)
+
+# Creamos las tasks correspondientes: 
+task_svm_exp5  <- TaskSurv$new(id = "test",  backend = test_svm_exp5,  time = "OverallSurvival_days", event = "Death")
+task_svm_exp7 <- TaskSurv$new(id = "test",  backend = test_svm_exp7,  time = "OverallSurvival_days", event = "Death")
+task_svm_exp11 <- TaskSurv$new(id = "test",  backend = test_svm_exp11,  time = "OverallSurvival_days", event = "Death")
+
+tasks <- list(
+  EXP5  = task_svm_exp5,
+  EXP7  = task_svm_exp7,
+  EXP11 = task_svm_exp11
+)
+```
+
+```{r}
+top_list <- list()
+
+# Calculamos la importancia de las variables por permutación usando el cambio en C-Index con modelos SVM:
+for (exp_id in names(learners_svm)) {
+  learner <- learners_svm[[exp_id]]
+  task    <- tasks[[exp_id]]
+  
+  # C-Index base (sin permutación): 
+  base_cidx <- learner$predict(task)$score(msr("surv.cindex"))
+  
+  # Conjunto de test asociado al experimento: 
+  df   <- as.data.table(test_sets[[exp_id]])
+  targets <- task$target_names
+  vars  <- setdiff(names(df), targets)
+  
+  # Calcular caída de C-Index al permutar cada variable: 
+  drops <- sapply(vars, function(v) {
+    df_perm      <- df
+    df_perm[[v]] <- sample(df_perm[[v]])
+    task_perm    <- TaskSurv$new(
+                      id      = "perm",
+                      backend = df_perm,
+                      time    = task$target_names[1],
+                      event   = task$target_names[2]
+                    )
+    learner$predict(task_perm)$score(msr("surv.cindex"))
+  })
+  
+  # Creamos un tibble con la caída en C-Index (mayor caída = mayor importancia): 
+  imp_df <- tibble(
+    variable   = vars,
+    importance = base_cidx - drops
+  ) %>%
+    arrange(desc(importance)) %>%
+    head(10) %>%
+    mutate(
+      exp_id = exp_id,
+      rank   = row_number(),
+      modelo = "SVM"
+    )
+  
+  top_list[[exp_id]] <- imp_df
+}
+
+# Unimos los resultados: 
+top_vars_svm <- bind_rows(top_list)
+```
+
+```{r}
+top_vars_svm <- top_vars_svm %>% 
+  mutate(exp_id = factor(exp_id, levels = c("EXP5", "EXP7", "EXP11")))
+
+top_plot <- top_vars_svm %>% 
+  group_by(exp_id) %>% 
+  arrange(importance) %>% 
+  mutate(var_uid = paste(exp_id, variable, sep = "__"),
+         var_uid = factor(var_uid, levels = var_uid)) %>% 
+  ungroup()
+
+ggplot(top_plot,
+       aes(x   = var_uid,
+           y   = importance,
+           fill = exp_id)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~ exp_id, scales = "free_y", nrow = 1) +
+  scale_x_discrete(labels = function(x) sub("^[^_]*__", "", x)) +  # solo muestra el nombre original
+  scale_fill_manual(values = c(
+    "EXP5"  = "#1B9E77",
+    "EXP7"  = "#6A51A3",
+    "EXP11" = "#9E9AC8"
+  )) +
+  labs(x = "Variable",
+       y = "Δ C-Index") +
+  theme_minimal(base_size = 13) +
+  theme(
+    text            = element_text(family = "Times New Roman"),
+    panel.spacing.x = unit(6, "pt"),
+    axis.text.x     = element_blank(),
+    axis.ticks.x    = element_blank()
+  )
+```

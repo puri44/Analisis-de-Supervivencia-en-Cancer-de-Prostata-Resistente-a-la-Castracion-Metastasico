@@ -2,6 +2,8 @@
 
 Este repositorio contiene los scripts organizados por etapas del análisis descrito en el documento principal. Cada carpeta corresponde a una fase específica del flujo de trabajo, desde el preprocesamiento de los datos hasta la generación de resultados finales.
 
+Los datos utilizados para realizar el estudio no son públicos actualmente. Se publicarán en un futuro. 
+
 ## 1. Preprocesamiento
 
 Esta carpeta incluye dos scripts responsables de cargar, limpiar y preparar los conjuntos de datos utilizados en el estudio.
